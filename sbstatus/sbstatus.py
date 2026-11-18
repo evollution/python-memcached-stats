@@ -10,16 +10,20 @@ scrisa automat intr-un SQLite de hook-uri. Zero tokeni: ruleaza doar cod, nu mod
 
 Hook-ul NU scrie nimic pe stdout: la SessionStart/UserPromptSubmit stdout-ul ar intra in contextul modelului.
 """
+import contextlib
 import html
 import http.server
+import io
 import json
 import os
 import re
+import secrets
 import shutil
 import sqlite3
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 
 DB = Path(os.environ.get("SBSTATUS_DB", str(Path.home() / ".claude" / "status" / "status.db")))
@@ -176,11 +180,13 @@ def cmd_list(show_all):
         print("  %-34s %-5s %-24s %s" % (r["name"][:34], r["age"], r["branch"][:24], r["detail"][:70]))
 
 
-def page():
+def page(token="", msg=""):
     parts = ["<!doctype html><meta charset=utf-8><meta http-equiv=refresh content=5><title>Thread-uri</title>"
              "<style>body{font:14px system-ui;background:#1b1b1b;color:#ddd;margin:24px}"
              "h2{margin:20px 0 6px;font-size:15px}td{padding:3px 14px 3px 0;white-space:nowrap}"
-             ".d{color:#999}</style>"]
+             ".d{color:#999}button{font:inherit;cursor:pointer}</style>"]
+    if msg:
+        parts.append("<pre>%s</pre>" % html.escape(msg))
     last = None
     for r in load():
         if r["status"] != last:
@@ -188,16 +194,32 @@ def page():
                 parts.append("</table>")
             parts.append("<h2>%s %s</h2><table>" % (ICON.get(r["status"], ""), html.escape(LABEL.get(r["status"], r["status"]))))
             last = r["status"]
-        parts.append("<tr><td>%s</td><td class=d>%s</td><td class=d>%s</td><td class=d>%s</td></tr>" % (
-            html.escape(r["name"]), r["age"], html.escape(r["branch"]), html.escape(r["detail"][:90])))
+        btn = "" if r["status"] in ("done", "ended") else (
+            "<form method=post action=/settle style=margin:0><input type=hidden name=t value=%s>"
+            "<input type=hidden name=f value='%s'><button>Settle</button></form>" % (token, html.escape(r["name"], quote=True)))
+        parts.append("<tr><td>%s</td><td class=d>%s</td><td class=d>%s</td><td class=d>%s</td><td>%s</td></tr>" % (
+            html.escape(r["name"]), r["age"], html.escape(r["branch"]), html.escape(r["detail"][:90]), btn))
     parts.append("</table>" if last is not None else "<p>Nicio sesiune inregistrata.</p>")
     return "".join(parts).encode()
 
 
 def cmd_serve(port):
+    token, msg = secrets.token_hex(8), [""]
+
     class H(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            form = urllib.parse.parse_qs(self.rfile.read(int(self.headers.get("Content-Length", 0))).decode())
+            if self.path == "/settle" and form.get("t", [""])[0] == token and form.get("f"):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    cmd_settle(form["f"][0])
+                msg[0] = buf.getvalue()
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.end_headers()
+
         def do_GET(self):
-            body = page()
+            body = page(token, msg[0])
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
