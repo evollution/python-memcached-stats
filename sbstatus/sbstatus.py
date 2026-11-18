@@ -194,7 +194,7 @@ def page(token="", msg=""):
                 parts.append("</table>")
             parts.append("<h2>%s %s</h2><table>" % (ICON.get(r["status"], ""), html.escape(LABEL.get(r["status"], r["status"]))))
             last = r["status"]
-        btn = "" if r["status"] in ("done", "ended") else (
+        btn = "" if r["status"] not in ("idle", "waiting", "ready", "stale") else (
             "<form method=post action=/settle style=margin:0><input type=hidden name=t value=%s>"
             "<input type=hidden name=f value='%s'><button>Settle</button></form>" % (token, html.escape(r["name"], quote=True)))
         parts.append("<tr><td>%s</td><td class=d>%s</td><td class=d>%s</td><td class=d>%s</td><td>%s</td></tr>" % (
@@ -242,8 +242,14 @@ def _git(d, *a):
 def cmd_settle(pattern):
     """Inchide thread-urile unui feature si scrie HANDOVER.md din git, ca urmatorul thread sa porneasca curat."""
     c = connect()
-    rows = c.execute("SELECT session_id,cwd FROM sessions WHERE status!='ended' AND (feature LIKE ? OR cwd LIKE ?)",
-                     ("%" + pattern + "%", "%" + pattern + "%")).fetchall()
+    like, stale = "%" + pattern + "%", time.time() - STALE_WORKING_S
+    busy = c.execute("SELECT COUNT(*) FROM sessions WHERE status='working' AND updated_at>=? AND (feature LIKE ? OR cwd LIKE ?)",
+                     (stale, like, like)).fetchone()[0]
+    rows = c.execute("SELECT session_id,cwd FROM sessions WHERE status NOT IN ('ended','done') "
+                     "AND (status!='working' OR updated_at<?) AND (feature LIKE ? OR cwd LIKE ?)",
+                     (stale, like, like)).fetchall()
+    if busy:
+        print("%d thread(uri) in lucru acum, nu le ating." % busy)
     if not rows:
         print("Nicio sesiune activa care sa se potriveasca cu %r" % pattern)
         return
