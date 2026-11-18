@@ -3,7 +3,7 @@
 scrisa automat intr-un SQLite de hook-uri. Zero tokeni: ruleaza doar cod, nu modelul.
 
   sbstatus.py hook                 (apelat de Claude Code, citeste JSON pe stdin)
-  sbstatus.py list [--all]         tabel in terminal
+  sbstatus.py list [--all] [--json] tabel in terminal (--json: o linie de stare per feature, pentru alte scripturi)
   sbstatus.py serve [--port 8765]  pagina locala cu refresh automat
   sbstatus.py settle <feature>     inchide munca pe modul: stare 'done' + HANDOVER.md generat din git (fara model)
   sbstatus.py install [--apply]    arata (sau scrie, cu backup) hook-urile in ~/.claude/settings.json
@@ -170,12 +170,74 @@ def load(show_all=False):
         if st == "working" and now - upd > STALE_WORKING_S:
             st = "stale"
         out.append(dict(sid=sid, name=feat or (Path(cwd).name if cwd else "?"), module=mod or "-",
-                        branch=br or "", status=st, detail=det or "", msg=lm, age=age(now - upd), upd=upd))
+                        branch=br or "", status=st, detail=det or "", msg=lm, age=age(now - upd), upd=upd, started=_s, cwd=cwd or ""))
     out.sort(key=lambda r: (ORDER.index(r["status"]) if r["status"] in ORDER else 99, -r["upd"]))
     return out
 
 
-def cmd_list(show_all):
+_GIT = {}
+WAIT_WORDS = ("revin", "am pornit", "în curs", "in curs")
+
+
+def feature_git(cwd):
+    """(necomise, neimpinse) pentru toate repo-urile din folderul feature-ului; cache 30 s."""
+    m = re.match(r"(.*/features/[^/]+)", cwd or "")
+    if not m:
+        return None
+    hit = _GIT.get(m.group(1))
+    if hit and time.time() - hit[0] < 30:
+        return hit[1]
+    dirty = ahead = 0
+    try:
+        for d in Path(m.group(1)).iterdir():
+            if (d / ".git").exists():
+                dirty += len([l for l in _git(d, "status", "--porcelain").splitlines() if l.strip()])
+                a = _git(d, "rev-list", "--count", "@{u}..")
+                ahead += int(a) if a.isdigit() else 0
+    except OSError:
+        return None
+    _GIT[m.group(1)] = (time.time(), (dirty, ahead))
+    return dirty, ahead
+
+
+def verdict(g):
+    """Motivele pentru care NU e bine sa dai Settle inca, plus starea git (None daca nu e feature)."""
+    m, why, gi = g["main"], [], feature_git(g["main"]["cwd"])
+    if g["busy"]:
+        why.append("%d sub-sesiuni încă rulează" % g["busy"])
+    if m["status"] == "waiting":
+        why.append("te așteaptă o întrebare sau o permisiune")
+    if gi and gi[0]:
+        why.append("%d modificări necomise" % gi[0])
+    if gi and gi[1]:
+        why.append("%d commituri neîmpinse" % gi[1])
+    if any(w in (m["msg"] or m["detail"])[-300:].lower() for w in WAIT_WORDS):
+        why.append("ultimul mesaj spune că a pornit ceva sau revine")
+    return why, gi
+
+
+def groups(rows):
+    """Un card per feature: thread-ul principal (cel mai vechi neinchis) + sub-sesiunile lui (review-uri etc.)."""
+    by = {}
+    for r in rows:
+        by.setdefault(r["name"], []).append(r)
+    out = []
+    for name, ms in by.items():
+        main = min([m for m in ms if m["status"] != "ended"] or ms, key=lambda m: m["started"])
+        subs = sorted((m for m in ms if m is not main), key=lambda m: m["started"])
+        busy = sum(1 for m in subs if m["status"] == "working")
+        st = "working" if main["status"] in ("idle", "done") and busy else main["status"]
+        out.append(dict(name=name, main=main, subs=subs, busy=busy, status=st, upd=max(m["upd"] for m in ms)))
+    out.sort(key=lambda g: (ORDER.index(g["status"]) if g["status"] in ORDER else 99, -g["upd"]))
+    return out
+
+
+def cmd_list(show_all, as_json=False):
+    if as_json:
+        print(json.dumps([dict(feature=g["name"], status=g["status"], age=g["main"]["age"], subsessions=len(g["subs"]),
+                               busy_subsessions=g["busy"], last=g["main"]["detail"]) for g in groups(load(show_all))],
+                         ensure_ascii=False, indent=1))
+        return
     rows, last = load(show_all), None
     if not rows:
         print("(nicio sesiune inregistrata)")
@@ -186,35 +248,62 @@ def cmd_list(show_all):
         print("  %-34s %-5s %-24s %s" % (r["name"][:34], r["age"], r["branch"][:24], r["detail"][:70]))
 
 
+DOT = {"waiting":"#f5a623","ready":"#2fbf71","working":"#4c8dff","stale":"#c9b458","idle":"#8a8a8a","done":"#3ba55d","ended":"#555"}
+
+
+def card_msg(r, cls=""):
+    if r["msg"]:
+        return "<details%s><summary>ⓘ %s</summary><pre>%s</pre></details>" % (
+            cls, html.escape(r["detail"][:140] or "ultimul mesaj"), html.escape(r["msg"]))
+    return "<div class=d>%s</div>" % html.escape(r["detail"][:140]) if r["detail"] else ""
+
+
 def page(token="", msg=""):
     parts = ["<!doctype html><meta charset=utf-8><title>Thread-uri</title>"
              "<style>body{font:14px system-ui;background:#1b1b1b;color:#ddd;margin:24px;max-width:980px}"
-             "h2{margin:22px 0 8px;font-size:15px}"
-             ".card{background:#242424;border:1px solid #333;border-radius:8px;padding:8px 12px;margin:6px 0}"
-             ".top{display:flex;gap:12px;align-items:center}.top b{font-weight:600}.sp{flex:1}.d{color:#999}"
-             "details{margin-top:4px}summary{cursor:pointer;color:#aaa;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
+             "h2{margin:24px 0 8px;font-size:15px}"
+             ".card{background:#242424;border:1px solid #333;border-radius:10px;padding:10px 14px;margin:8px 0}"
+             ".top{display:flex;gap:12px;align-items:center}.dot{width:10px;height:10px;border-radius:50%;flex:none}"
+             ".ttl b{font-weight:600}.sub{color:#9a9a9a;font-size:12.5px;margin-top:2px}.sp{flex:1}.d{color:#999;margin-top:4px}"
+             ".age{color:#9a9a9a;font-size:12.5px}.v{margin-top:8px;font-size:13px}"
+             "details{margin-top:6px}summary{cursor:pointer;color:#aaa;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
              "pre{white-space:pre-wrap;word-break:break-word;background:#1b1b1b;border-radius:6px;padding:10px;margin:8px 0 2px;"
              "color:#ddd;font:13px/1.45 ui-monospace,monospace;max-height:420px;overflow:auto}"
+             ".subs{margin:10px 0 0 22px;border-left:2px solid #333;padding-left:12px}"
+             ".subrow{margin:6px 0;font-size:13px}.subrow .age{margin-left:8px}"
              "button{font:inherit;cursor:pointer}</style>"
              "<script>setInterval(function(){if(!document.querySelector('details[open]'))location.reload()},5000)</script>"]
     if msg:
         parts.append("<pre>%s</pre>" % html.escape(msg))
     last = None
-    for r in load():
-        if r["status"] != last:
-            parts.append("<h2>%s %s</h2>" % (ICON.get(r["status"], ""), html.escape(LABEL.get(r["status"], r["status"]))))
-            last = r["status"]
-        btn = "" if r["status"] not in ("idle", "waiting", "ready", "stale") else (
+    for g in groups(load()):
+        if g["status"] != last:
+            parts.append("<h2>%s %s</h2>" % (ICON.get(g["status"], ""), html.escape(LABEL.get(g["status"], g["status"]))))
+            last = g["status"]
+        m = g["main"]
+        busy_any = m["status"] == "working" or g["busy"]
+        btn = "" if (g["status"] not in ("idle", "waiting", "ready", "stale") or busy_any) else (
             "<form method=post action=/settle style=margin:0><input type=hidden name=t value=%s>"
-            "<input type=hidden name=f value='%s'><button>Settle</button></form>" % (token, html.escape(r["name"], quote=True)))
-        if r["msg"]:
-            body = "<details><summary>ⓘ %s</summary><pre>%s</pre></details>" % (
-                html.escape(r["detail"][:140] or "ultimul mesaj"), html.escape(r["msg"]))
-        else:
-            body = "<div class=d>%s</div>" % html.escape(r["detail"][:140]) if r["detail"] else ""
-        parts.append("<div class=card><div class=top><b>%s</b><span class=d>%s</span><span class=d>%s</span>"
-                     "<span class=sp></span>%s</div>%s</div>" % (
-                         html.escape(r["name"]), r["age"], html.escape(r["branch"]), btn, body))
+            "<input type=hidden name=f value='%s'><button>Settle</button></form>" % (token, html.escape(g["name"], quote=True)))
+        sub = [LABEL.get(m["status"], m["status"]), html.escape(m["branch"])]
+        if g["busy"]:
+            sub.append("așteaptă %d sub-sesiuni" % g["busy"])
+        why, gi = verdict(g)
+        vline = "" if g["status"] in ("done", "ended") else (
+            "<div class=v style='color:#f5a623'>⚠ Nu închide încă: %s</div>" % html.escape("; ".join(why)) if why else
+            "<div class=v style='color:#2fbf71'>✓ Poți închide: nimic nu rulează%s</div>" % (", totul comis și împins" if gi else ""))
+        parts.append("<div class=card><div class=top><span class=dot style='background:%s'></span>"
+                     "<div class=ttl><b>%s</b><div class=sub>%s</div></div><span class=sp></span>"
+                     "<span class=age>%s</span>%s</div>%s%s" % (
+                         DOT.get(g["status"], "#888"), html.escape(g["name"]), " · ".join(x for x in sub if x),
+                         m["age"], btn, vline, card_msg(m)))
+        if g["subs"]:
+            parts.append("<div class=subs>")
+            for r in g["subs"]:
+                parts.append("<div class=subrow>%s sub-sesiune %s<span class=age>%s</span>%s</div>" % (
+                    ICON.get(r["status"], ""), html.escape(r["sid"][:6]), r["age"], card_msg(r)))
+            parts.append("</div>")
+        parts.append("</div>")
     if last is None:
         parts.append("<p>Nicio sesiune inregistrata.</p>")
     return "".join(parts).encode()
@@ -326,7 +415,7 @@ def main(argv):
             pass                                    # un hook nu trebuie sa strice niciodata un thread
         return 0
     if cmd == "list":
-        cmd_list("--all" in argv)
+        cmd_list("--all" in argv, "--json" in argv)
     elif cmd == "serve":
         cmd_serve(int(argv[argv.index("--port") + 1]) if "--port" in argv else 8765)
     elif cmd == "settle" and len(argv) > 2:
