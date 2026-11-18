@@ -42,6 +42,10 @@ def connect():
     c.execute("""CREATE TABLE IF NOT EXISTS sessions(
         session_id TEXT PRIMARY KEY, feature TEXT, module TEXT, cwd TEXT, branch TEXT,
         status TEXT, detail TEXT, started_at REAL, updated_at REAL)""")
+    try:
+        c.execute("ALTER TABLE sessions ADD COLUMN last_msg TEXT")   # migrare pentru baze mai vechi
+    except sqlite3.OperationalError:
+        pass
     return c
 
 
@@ -106,7 +110,7 @@ def hook():
     if not sid:
         return
     cwd = p.get("cwd") or os.getcwd()
-    status, detail, branch = None, None, None
+    status, detail, branch, msg = None, None, None, None
     if ev == "SessionStart":
         status, branch = "idle", git_branch(cwd)
     elif ev == "UserPromptSubmit":
@@ -130,6 +134,7 @@ def hook():
     elif ev == "Stop":
         text = p.get("last_assistant_message") or last_assistant_text(p.get("transcript_path", ""))
         status, detail = classify(text)
+        msg = text[:6000]
         branch = git_branch(cwd)
     elif ev == "SessionEnd":
         status = "ended"
@@ -138,13 +143,14 @@ def hook():
     feature, module = feature_of(cwd)
     now = time.time()
     c = connect()
-    c.execute("""INSERT INTO sessions(session_id,feature,module,cwd,branch,status,detail,started_at,updated_at)
-                 VALUES(?,?,?,?,?,?,?,?,?)
+    c.execute("""INSERT INTO sessions(session_id,feature,module,cwd,branch,status,detail,started_at,updated_at,last_msg)
+                 VALUES(?,?,?,?,?,?,?,?,?,?)
                  ON CONFLICT(session_id) DO UPDATE SET
                    cwd=excluded.cwd, feature=excluded.feature, module=excluded.module,
                    branch=COALESCE(excluded.branch, branch), status=excluded.status,
-                   detail=COALESCE(excluded.detail, detail), updated_at=excluded.updated_at""",
-              (sid, feature, module, cwd, branch, status, detail, now, now))
+                   detail=COALESCE(excluded.detail, detail), updated_at=excluded.updated_at,
+                   last_msg=COALESCE(excluded.last_msg, last_msg)""",
+              (sid, feature, module, cwd, branch, status, detail, now, now, msg))
     c.commit()
 
 
@@ -157,14 +163,14 @@ def age(s):
 def load(show_all=False):
     now, out = time.time(), []
     c = connect()
-    for sid, feat, mod, cwd, br, st, det, _s, upd in c.execute(
-            "SELECT session_id,feature,module,cwd,branch,status,detail,started_at,updated_at FROM sessions"):
+    for sid, feat, mod, cwd, br, st, det, _s, upd, lm in c.execute(
+            "SELECT session_id,feature,module,cwd,branch,status,detail,started_at,updated_at,COALESCE(last_msg,'') FROM sessions"):
         if st == "ended" and not show_all and now - upd > 3600:
             continue
         if st == "working" and now - upd > STALE_WORKING_S:
             st = "stale"
         out.append(dict(sid=sid, name=feat or (Path(cwd).name if cwd else "?"), module=mod or "-",
-                        branch=br or "", status=st, detail=det or "", age=age(now - upd), upd=upd))
+                        branch=br or "", status=st, detail=det or "", msg=lm, age=age(now - upd), upd=upd))
     out.sort(key=lambda r: (ORDER.index(r["status"]) if r["status"] in ORDER else 99, -r["upd"]))
     return out
 
@@ -181,25 +187,36 @@ def cmd_list(show_all):
 
 
 def page(token="", msg=""):
-    parts = ["<!doctype html><meta charset=utf-8><meta http-equiv=refresh content=5><title>Thread-uri</title>"
-             "<style>body{font:14px system-ui;background:#1b1b1b;color:#ddd;margin:24px}"
-             "h2{margin:20px 0 6px;font-size:15px}td{padding:3px 14px 3px 0;white-space:nowrap}"
-             ".d{color:#999}button{font:inherit;cursor:pointer}</style>"]
+    parts = ["<!doctype html><meta charset=utf-8><title>Thread-uri</title>"
+             "<style>body{font:14px system-ui;background:#1b1b1b;color:#ddd;margin:24px;max-width:980px}"
+             "h2{margin:22px 0 8px;font-size:15px}"
+             ".card{background:#242424;border:1px solid #333;border-radius:8px;padding:8px 12px;margin:6px 0}"
+             ".top{display:flex;gap:12px;align-items:center}.top b{font-weight:600}.sp{flex:1}.d{color:#999}"
+             "details{margin-top:4px}summary{cursor:pointer;color:#aaa;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}"
+             "pre{white-space:pre-wrap;word-break:break-word;background:#1b1b1b;border-radius:6px;padding:10px;margin:8px 0 2px;"
+             "color:#ddd;font:13px/1.45 ui-monospace,monospace;max-height:420px;overflow:auto}"
+             "button{font:inherit;cursor:pointer}</style>"
+             "<script>setInterval(function(){if(!document.querySelector('details[open]'))location.reload()},5000)</script>"]
     if msg:
         parts.append("<pre>%s</pre>" % html.escape(msg))
     last = None
     for r in load():
         if r["status"] != last:
-            if last is not None:
-                parts.append("</table>")
-            parts.append("<h2>%s %s</h2><table>" % (ICON.get(r["status"], ""), html.escape(LABEL.get(r["status"], r["status"]))))
+            parts.append("<h2>%s %s</h2>" % (ICON.get(r["status"], ""), html.escape(LABEL.get(r["status"], r["status"]))))
             last = r["status"]
         btn = "" if r["status"] not in ("idle", "waiting", "ready", "stale") else (
             "<form method=post action=/settle style=margin:0><input type=hidden name=t value=%s>"
             "<input type=hidden name=f value='%s'><button>Settle</button></form>" % (token, html.escape(r["name"], quote=True)))
-        parts.append("<tr><td>%s</td><td class=d>%s</td><td class=d>%s</td><td class=d>%s</td><td>%s</td></tr>" % (
-            html.escape(r["name"]), r["age"], html.escape(r["branch"]), html.escape(r["detail"][:90]), btn))
-    parts.append("</table>" if last is not None else "<p>Nicio sesiune inregistrata.</p>")
+        if r["msg"]:
+            body = "<details><summary>ⓘ %s</summary><pre>%s</pre></details>" % (
+                html.escape(r["detail"][:140] or "ultimul mesaj"), html.escape(r["msg"]))
+        else:
+            body = "<div class=d>%s</div>" % html.escape(r["detail"][:140]) if r["detail"] else ""
+        parts.append("<div class=card><div class=top><b>%s</b><span class=d>%s</span><span class=d>%s</span>"
+                     "<span class=sp></span>%s</div>%s</div>" % (
+                         html.escape(r["name"]), r["age"], html.escape(r["branch"]), btn, body))
+    if last is None:
+        parts.append("<p>Nicio sesiune inregistrata.</p>")
     return "".join(parts).encode()
 
 
