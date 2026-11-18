@@ -180,7 +180,7 @@ WAIT_WORDS = ("revin", "am pornit", "în curs", "in curs")
 
 
 def feature_git(cwd):
-    """(necomise, neimpinse) pentru toate repo-urile din folderul feature-ului; cache 30 s."""
+    """(fisiere necomise, repo-uri cu HEAD nepus pe GitHub); stie doar ce a vazut ultimul fetch. Cache 30 s."""
     m = re.match(r"(.*/features/[^/]+)", cwd or "")
     if not m:
         return None
@@ -192,8 +192,8 @@ def feature_git(cwd):
         for d in Path(m.group(1)).iterdir():
             if (d / ".git").exists():
                 dirty += len([l for l in _git(d, "status", "--porcelain").splitlines() if l.strip()])
-                a = _git(d, "rev-list", "--count", "@{u}..")
-                ahead += int(a) if a.isdigit() else 0
+                if not _git(d, "branch", "-r", "--contains", "HEAD"):   # HEAD nu e pe niciun branch remote
+                    ahead += 1
     except OSError:
         return None
     _GIT[m.group(1)] = (time.time(), (dirty, ahead))
@@ -210,7 +210,7 @@ def verdict(g):
     if gi and gi[0]:
         why.append("%d modificări necomise" % gi[0])
     if gi and gi[1]:
-        why.append("%d commituri neîmpinse" % gi[1])
+        why.append("%d repo-uri cu commituri neîmpinse (nu sunt pe GitHub)" % gi[1])
     if any(w in (m["msg"] or m["detail"])[-300:].lower() for w in WAIT_WORDS):
         why.append("ultimul mesaj spune că a pornit ceva sau revine")
     return why, gi
